@@ -32,10 +32,11 @@ function onOpen() {
   if (access.permissions.storekeeperDashboard) menu.addItem('4. Дашборд кладовщика', 'showStorekeeperDashboard');
   if (access.permissions.managementDashboard) menu.addItem('5. Дашборд руководителя', 'showManagementDashboard');
   if (access.permissions.fleetDashboard) menu.addItem('6. Автопарк и поездки', 'showFleetTripsDashboard');
+  if (hasCargoTripsRole_(access.role)) menu.addItem('7. Грузоперевозки', 'showCargoTripsApp');
   if (access.permissions.manageAccess) {
     menu.addSeparator();
-    menu.addItem('6. Управление доступом', 'showAccessAdminPanel');
-    menu.addItem('7. Защитить листы', 'syncSheetProtections');
+    menu.addItem('8. Управление доступом', 'showAccessAdminPanel');
+    menu.addItem('9. Защитить листы', 'syncSheetProtections');
   }
   menu.addToUi();
 }
@@ -3733,4 +3734,631 @@ function saveFleetAccumulationWriteoff(payload) {
 
   sh.appendRow([id, writeoffDate, employee, round2_(amount), reason, comment, now, user]);
   return 'Списание сохранено: ' + employee + ' — ' + fmtMoney_(amount);
+}
+
+/**
+ * =========================
+ * CARGO TRIPS MODULE
+ * =========================
+ */
+const CARGO_TRIPS_ALLOWED_ROLES = ['Руководитель', 'Инженер по снабжению'];
+const CARGO_TRIPS_SHEET_TRIPS = 'Поездки';
+const CARGO_TRIPS_SHEET_CARGO = 'МаршрутыГрузов';
+const CARGO_TRIPS_SHEET_SETTINGS = 'Настройки';
+const CARGO_TRIPS_SHEET_DICT = 'Справочники';
+const CARGO_TRIPS_SHEET_DASHBOARD = 'Дашборд';
+
+function hasCargoTripsRole_(roleName) {
+  const role = String(roleName || '').trim();
+  return CARGO_TRIPS_ALLOWED_ROLES.indexOf(role) !== -1;
+}
+
+function requireCargoTripsAccess_(actionName) {
+  const access = getCurrentUserAccess_();
+  if (hasCargoTripsRole_(access.role)) return access;
+  throw new Error('Нет доступа: ' + actionName + '. Разрешено только для ролей: ' + CARGO_TRIPS_ALLOWED_ROLES.join(', ') + '.');
+}
+
+function showCargoTripsApp() {
+  requireCargoTripsAccess_('модуль "Грузоперевозки"');
+  const html = HtmlService.createHtmlOutputFromFile('TripsApp')
+    .setWidth(1480)
+    .setHeight(920);
+  SpreadsheetApp.getUi().showModalDialog(html, 'Грузоперевозки');
+}
+
+function cargoTripsSetupSpreadsheet() {
+  requireCargoTripsAccess_('инициализация листов модуля "Грузоперевозки"');
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  const tripsSheet = cargoTripsGetOrCreateSheet_(ss, CARGO_TRIPS_SHEET_TRIPS);
+  const cargoSheet = cargoTripsGetOrCreateSheet_(ss, CARGO_TRIPS_SHEET_CARGO);
+  const settingsSheet = cargoTripsGetOrCreateSheet_(ss, CARGO_TRIPS_SHEET_SETTINGS);
+  const dictSheet = cargoTripsGetOrCreateSheet_(ss, CARGO_TRIPS_SHEET_DICT);
+  const dashboardSheet = cargoTripsGetOrCreateSheet_(ss, CARGO_TRIPS_SHEET_DASHBOARD);
+
+  cargoTripsPrepareSheet_(tripsSheet, [[
+    'ID',
+    'Дата',
+    'Основной маршрут',
+    'Общий километраж',
+    'Холостой пробег (км)',
+    'Общая выручка',
+    'Топливо основного пробега',
+    'Топливо холостого пробега',
+    'Остаток после топлива',
+    'Лизинг',
+    'Ремонт',
+    'Водитель до корректировок',
+    'Корректировка водителя за холостой пробег',
+    'Налог',
+    'Водитель к выплате',
+    'Итог компании',
+    'Типы оплат',
+    'Комментарий',
+    'Создано',
+    'Обновлено'
+  ]]);
+
+  cargoTripsPrepareSheet_(cargoSheet, [[
+    'ID поездки',
+    'Маршрут',
+    'Цена',
+    'Вид оплаты',
+    'Выделенная доля топлива',
+    'Остаток после топлива',
+    'Лизинг',
+    'Ремонт',
+    'Водитель до налога',
+    'Налог',
+    'Водитель после налога'
+  ]]);
+
+  cargoTripsPrepareSheet_(settingsSheet, [
+    ['Параметр', 'Значение', 'Описание'],
+    ['diesel_price', 73, 'Цена дизеля, руб/литр'],
+    ['fuel_consumption_per_100km', 11, 'Расход, литров на 100 км'],
+    ['leasing_percent', 20, 'Процент на лизинг'],
+    ['repair_percent', 40, 'Процент на ремонт'],
+    ['driver_percent', 40, 'Процент водителю'],
+    ['vat_driver_tax_percent', 19, 'Налог с доли водителя для маршрутов С НДС'],
+    ['idle_driver_percent', 50, 'Процент топлива холостого пробега, который удерживается с водителя'],
+    ['currency_symbol', 'руб.', 'Символ валюты']
+  ]);
+
+  cargoTripsPrepareSheet_(dictSheet, [
+    ['Тип', 'Значение'],
+    ['Вид оплаты', 'Наличные'],
+    ['Вид оплаты', 'Без НДС'],
+    ['Вид оплаты', 'С НДС']
+  ]);
+
+  if (dashboardSheet.getLastRow() === 0) {
+    dashboardSheet.getRange(1, 1).setValue('Дашборд доступен в окне приложения.');
+  }
+
+  cargoTripsStyleSheet_(tripsSheet);
+  cargoTripsStyleSheet_(cargoSheet);
+  cargoTripsStyleSheet_(settingsSheet);
+  cargoTripsStyleSheet_(dictSheet);
+  cargoTripsStyleSheet_(dashboardSheet);
+
+  tripsSheet.setFrozenRows(1);
+  cargoSheet.setFrozenRows(1);
+  settingsSheet.setFrozenRows(1);
+  dictSheet.setFrozenRows(1);
+
+  tripsSheet.autoResizeColumns(1, 20);
+  cargoSheet.autoResizeColumns(1, 11);
+  settingsSheet.autoResizeColumns(1, 3);
+  dictSheet.autoResizeColumns(1, 2);
+
+  SpreadsheetApp.flush();
+}
+
+function cargoTripsGetAppData() {
+  requireCargoTripsAccess_('чтение данных модуля "Грузоперевозки"');
+  cargoTripsSetupSpreadsheet();
+
+  const settings = cargoTripsGetSettings_();
+  const paymentTypes = cargoTripsGetPaymentTypes_();
+  const trips = cargoTripsGetAllTrips_();
+
+  return {
+    settings: settings,
+    paymentTypes: paymentTypes,
+    trips: trips,
+    dashboard: cargoTripsBuildDashboard_(trips)
+  };
+}
+
+function cargoTripsGetTripById(tripId) {
+  requireCargoTripsAccess_('чтение поездки модуля "Грузоперевозки"');
+  const trips = cargoTripsGetAllTrips_();
+  return trips.find(function (t) { return t.id === tripId; }) || null;
+}
+
+function cargoTripsSaveTrip(payload) {
+  requireCargoTripsAccess_('сохранение поездки модуля "Грузоперевозки"');
+  cargoTripsValidateTripPayload_(payload);
+  cargoTripsSetupSpreadsheet();
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const tripsSheet = ss.getSheetByName(CARGO_TRIPS_SHEET_TRIPS);
+  const cargoSheet = ss.getSheetByName(CARGO_TRIPS_SHEET_CARGO);
+
+  const settings = cargoTripsGetSettings_();
+  const calculation = cargoTripsCalculateTrip_(payload, settings);
+  const now = new Date();
+
+  let tripId = payload.id;
+  const isEdit = Boolean(tripId);
+
+  if (!tripId) {
+    tripId = cargoTripsGenerateTripId_();
+  }
+
+  const tripRecord = [
+    tripId,
+    cargoTripsNormalizeDate_(payload.date),
+    payload.mainRoute,
+    cargoTripsToNumber_(payload.totalKm),
+    cargoTripsToNumber_(payload.idleKm),
+    calculation.totalRevenue,
+    calculation.fuelMain,
+    calculation.fuelIdle,
+    calculation.remainderAfterFuel,
+    calculation.leasing,
+    calculation.repair,
+    calculation.driverBeforeAdjustments,
+    calculation.driverIdleAdjustment,
+    calculation.tax,
+    calculation.driverFinal,
+    calculation.companyFinal,
+    calculation.paymentTypesLabel,
+    payload.comment || '',
+    isEdit ? cargoTripsGetCreatedAtById_(tripId) : now,
+    now
+  ];
+
+  if (isEdit) {
+    const rowIndex = cargoTripsFindRowById_(tripsSheet, tripId);
+    if (!rowIndex) {
+      throw new Error('Поездка для редактирования не найдена.');
+    }
+    tripsSheet.getRange(rowIndex, 1, 1, tripRecord.length).setValues([tripRecord]);
+    cargoTripsDeleteCargoByTripId_(cargoSheet, tripId);
+  } else {
+    tripsSheet.appendRow(tripRecord);
+  }
+
+  const cargoRows = calculation.cargoBreakdown.map(function (item) {
+    return [
+      tripId,
+      item.route,
+      item.price,
+      item.paymentType,
+      item.allocatedFuel,
+      item.remainderAfterFuel,
+      item.leasing,
+      item.repair,
+      item.driverBeforeTax,
+      item.tax,
+      item.driverAfterTax
+    ];
+  });
+
+  if (cargoRows.length > 0) {
+    cargoSheet.getRange(cargoSheet.getLastRow() + 1, 1, cargoRows.length, cargoRows[0].length).setValues(cargoRows);
+  }
+
+  return {
+    success: true,
+    tripId: tripId,
+    message: isEdit ? 'Поездка обновлена.' : 'Поездка сохранена.'
+  };
+}
+
+function cargoTripsDeleteTrip(tripId) {
+  requireCargoTripsAccess_('удаление поездки модуля "Грузоперевозки"');
+  if (!tripId) {
+    throw new Error('Не указан ID поездки.');
+  }
+
+  cargoTripsSetupSpreadsheet();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const tripsSheet = ss.getSheetByName(CARGO_TRIPS_SHEET_TRIPS);
+  const cargoSheet = ss.getSheetByName(CARGO_TRIPS_SHEET_CARGO);
+
+  const rowIndex = cargoTripsFindRowById_(tripsSheet, tripId);
+  if (!rowIndex) {
+    throw new Error('Поездка не найдена.');
+  }
+
+  tripsSheet.deleteRow(rowIndex);
+  cargoTripsDeleteCargoByTripId_(cargoSheet, tripId);
+
+  return { success: true };
+}
+
+function cargoTripsSaveSettings(settingsObj) {
+  requireCargoTripsAccess_('сохранение настроек модуля "Грузоперевозки"');
+  cargoTripsSetupSpreadsheet();
+
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CARGO_TRIPS_SHEET_SETTINGS);
+  if (!sheet) {
+    throw new Error('Лист Настройки не найден.');
+  }
+
+  const values = sheet.getDataRange().getValues();
+  const map = {};
+  for (let i = 1; i < values.length; i++) {
+    map[values[i][0]] = i + 1;
+  }
+
+  Object.keys(settingsObj || {}).forEach(function (key) {
+    if (map[key]) {
+      sheet.getRange(map[key], 2).setValue(settingsObj[key]);
+    }
+  });
+
+  return {
+    success: true,
+    settings: cargoTripsGetSettings_()
+  };
+}
+
+function cargoTripsGetAllTrips_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const tripsSheet = ss.getSheetByName(CARGO_TRIPS_SHEET_TRIPS);
+  const cargoSheet = ss.getSheetByName(CARGO_TRIPS_SHEET_CARGO);
+
+  if (!tripsSheet || tripsSheet.getLastRow() < 2) {
+    return [];
+  }
+
+  const tripValues = tripsSheet.getDataRange().getValues();
+  const cargoValues = cargoSheet && cargoSheet.getLastRow() >= 2
+    ? cargoSheet.getDataRange().getValues()
+    : [];
+
+  const cargoMap = {};
+  for (let i = 1; i < cargoValues.length; i++) {
+    const row = cargoValues[i];
+    const tripId = String(row[0] || '');
+    if (!tripId) continue;
+
+    if (!cargoMap[tripId]) {
+      cargoMap[tripId] = [];
+    }
+
+    cargoMap[tripId].push({
+      route: row[1] || '',
+      price: cargoTripsToNumber_(row[2]),
+      paymentType: row[3] || '',
+      allocatedFuel: cargoTripsToNumber_(row[4]),
+      remainderAfterFuel: cargoTripsToNumber_(row[5]),
+      leasing: cargoTripsToNumber_(row[6]),
+      repair: cargoTripsToNumber_(row[7]),
+      driverBeforeTax: cargoTripsToNumber_(row[8]),
+      tax: cargoTripsToNumber_(row[9]),
+      driverAfterTax: cargoTripsToNumber_(row[10])
+    });
+  }
+
+  const trips = [];
+  for (let i = 1; i < tripValues.length; i++) {
+    const r = tripValues[i];
+    if (!r[0]) continue;
+
+    trips.push({
+      id: String(r[0]),
+      date: cargoTripsFormatDateForClient_(r[1]),
+      mainRoute: r[2] || '',
+      totalKm: cargoTripsToNumber_(r[3]),
+      idleKm: cargoTripsToNumber_(r[4]),
+      totalRevenue: cargoTripsToNumber_(r[5]),
+      fuelMain: cargoTripsToNumber_(r[6]),
+      fuelIdle: cargoTripsToNumber_(r[7]),
+      remainderAfterFuel: cargoTripsToNumber_(r[8]),
+      leasing: cargoTripsToNumber_(r[9]),
+      repair: cargoTripsToNumber_(r[10]),
+      driverBeforeAdjustments: cargoTripsToNumber_(r[11]),
+      driverIdleAdjustment: cargoTripsToNumber_(r[12]),
+      tax: cargoTripsToNumber_(r[13]),
+      driverFinal: cargoTripsToNumber_(r[14]),
+      companyFinal: cargoTripsToNumber_(r[15]),
+      paymentTypesLabel: r[16] || '',
+      comment: r[17] || '',
+      createdAt: cargoTripsFormatDateTimeForClient_(r[18]),
+      updatedAt: cargoTripsFormatDateTimeForClient_(r[19]),
+      cargoRoutes: cargoMap[String(r[0])] || []
+    });
+  }
+
+  trips.sort(function (a, b) {
+    const da = new Date(a.date || '1970-01-01');
+    const db = new Date(b.date || '1970-01-01');
+    return db - da;
+  });
+
+  return trips;
+}
+
+function cargoTripsGetSettings_() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CARGO_TRIPS_SHEET_SETTINGS);
+  if (!sheet || sheet.getLastRow() < 2) {
+    return {
+      diesel_price: 73,
+      fuel_consumption_per_100km: 11,
+      leasing_percent: 20,
+      repair_percent: 40,
+      driver_percent: 40,
+      vat_driver_tax_percent: 19,
+      idle_driver_percent: 50,
+      currency_symbol: 'руб.'
+    };
+  }
+
+  const values = sheet.getDataRange().getValues();
+  const settings = {};
+  for (let i = 1; i < values.length; i++) {
+    settings[values[i][0]] = values[i][1];
+  }
+
+  return settings;
+}
+
+function cargoTripsGetPaymentTypes_() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CARGO_TRIPS_SHEET_DICT);
+  if (!sheet || sheet.getLastRow() < 2) {
+    return ['Наличные', 'Без НДС', 'С НДС'];
+  }
+
+  return sheet.getDataRange().getValues()
+    .filter(function (row, index) { return index > 0 && row[0] === 'Вид оплаты' && row[1]; })
+    .map(function (row) { return row[1]; });
+}
+
+function cargoTripsCalculateTrip_(payload, settings) {
+  const dieselPrice = cargoTripsToNumber_(settings.diesel_price);
+  const consumptionPer100 = cargoTripsToNumber_(settings.fuel_consumption_per_100km);
+  const leasingPercent = cargoTripsToNumber_(settings.leasing_percent) / 100;
+  const repairPercent = cargoTripsToNumber_(settings.repair_percent) / 100;
+  const driverPercent = cargoTripsToNumber_(settings.driver_percent) / 100;
+  const vatDriverTaxPercent = cargoTripsToNumber_(settings.vat_driver_tax_percent) / 100;
+  const idleDriverPercent = cargoTripsToNumber_(settings.idle_driver_percent) / 100;
+
+  const totalKm = cargoTripsToNumber_(payload.totalKm);
+  const idleKm = cargoTripsToNumber_(payload.idleKm);
+  const cargoRoutes = payload.cargoRoutes || [];
+
+  const fuelCostPerKm = (consumptionPer100 * dieselPrice) / 100;
+  const fuelTotal = cargoTripsRound_(totalKm * fuelCostPerKm);
+
+  const idleShare = totalKm > 0 ? idleKm / totalKm : 0;
+  const fuelIdle = cargoTripsRound_(fuelTotal * idleShare);
+  const fuelMain = cargoTripsRound_(fuelTotal - fuelIdle);
+
+  const totalRevenue = cargoTripsRound_(
+    cargoRoutes.reduce(function (sum, item) { return sum + cargoTripsToNumber_(item.price); }, 0)
+  );
+
+  const cargoBreakdown = cargoRoutes.map(function (item) {
+    const price = cargoTripsRound_(cargoTripsToNumber_(item.price));
+    const share = totalRevenue > 0 ? price / totalRevenue : 0;
+    const allocatedFuel = cargoTripsRound_(fuelMain * share);
+    const remainderAfterFuel = cargoTripsRound_(price - allocatedFuel);
+
+    const leasing = cargoTripsRound_(remainderAfterFuel * leasingPercent);
+    const repair = cargoTripsRound_(remainderAfterFuel * repairPercent);
+    const driverBeforeTax = cargoTripsRound_(remainderAfterFuel * driverPercent);
+
+    const tax = item.paymentType === 'С НДС'
+      ? cargoTripsRound_(driverBeforeTax * vatDriverTaxPercent)
+      : 0;
+
+    const driverAfterTax = cargoTripsRound_(driverBeforeTax - tax);
+
+    return {
+      route: item.route,
+      price: price,
+      paymentType: item.paymentType,
+      allocatedFuel: allocatedFuel,
+      remainderAfterFuel: remainderAfterFuel,
+      leasing: leasing,
+      repair: repair,
+      driverBeforeTax: driverBeforeTax,
+      tax: tax,
+      driverAfterTax: driverAfterTax
+    };
+  });
+
+  const remainderAfterFuel = cargoTripsRound_(cargoBreakdown.reduce(function (sum, x) { return sum + x.remainderAfterFuel; }, 0));
+  const leasing = cargoTripsRound_(cargoBreakdown.reduce(function (sum, x) { return sum + x.leasing; }, 0));
+  const repair = cargoTripsRound_(cargoBreakdown.reduce(function (sum, x) { return sum + x.repair; }, 0));
+  const driverBeforeAdjustments = cargoTripsRound_(cargoBreakdown.reduce(function (sum, x) { return sum + x.driverAfterTax; }, 0));
+  const tax = cargoTripsRound_(cargoBreakdown.reduce(function (sum, x) { return sum + x.tax; }, 0));
+
+  const driverIdleAdjustment = cargoTripsRound_(fuelIdle * idleDriverPercent);
+  const companyIdleAdjustment = cargoTripsRound_(fuelIdle - driverIdleAdjustment);
+
+  const driverFinal = cargoTripsRound_(driverBeforeAdjustments - driverIdleAdjustment);
+  const companyFinal = cargoTripsRound_(leasing + repair - companyIdleAdjustment);
+
+  const uniqueTypes = Array.from(new Set(cargoRoutes.map(function (item) { return item.paymentType; }).filter(Boolean)));
+
+  return {
+    totalRevenue: totalRevenue,
+    fuelMain: fuelMain,
+    fuelIdle: fuelIdle,
+    remainderAfterFuel: remainderAfterFuel,
+    leasing: leasing,
+    repair: repair,
+    driverBeforeAdjustments: driverBeforeAdjustments,
+    driverIdleAdjustment: driverIdleAdjustment,
+    tax: tax,
+    driverFinal: driverFinal,
+    companyFinal: companyFinal,
+    paymentTypesLabel: uniqueTypes.join(', '),
+    cargoBreakdown: cargoBreakdown
+  };
+}
+
+function cargoTripsRound_(num) {
+  return Math.round(num);
+}
+
+function cargoTripsBuildDashboard_(trips) {
+  const result = {
+    totalTrips: trips.length,
+    totalRevenue: 0,
+    totalFuel: 0,
+    totalCompany: 0,
+    totalDriver: 0,
+    totalTax: 0
+  };
+
+  trips.forEach(function (t) {
+    result.totalRevenue += cargoTripsToNumber_(t.totalRevenue);
+    result.totalFuel += cargoTripsToNumber_(t.fuelMain) + cargoTripsToNumber_(t.fuelIdle);
+    result.totalCompany += cargoTripsToNumber_(t.companyFinal);
+    result.totalDriver += cargoTripsToNumber_(t.driverFinal);
+    result.totalTax += cargoTripsToNumber_(t.tax);
+  });
+
+  Object.keys(result).forEach(function (key) {
+    if (key !== 'totalTrips') {
+      result[key] = round2_(result[key]);
+    }
+  });
+
+  return result;
+}
+
+function cargoTripsValidateTripPayload_(payload) {
+  if (!payload) throw new Error('Нет данных поездки.');
+  if (!payload.date) throw new Error('Укажи дату поездки.');
+  if (!payload.mainRoute || !String(payload.mainRoute).trim()) throw new Error('Укажи основной маршрут.');
+  if (cargoTripsToNumber_(payload.totalKm) <= 0) throw new Error('Общий километраж должен быть больше нуля.');
+  if (!payload.cargoRoutes || payload.cargoRoutes.length === 0) throw new Error('Добавь хотя бы один маршрут груза.');
+
+  payload.cargoRoutes.forEach(function (item, index) {
+    if (!item.route || !String(item.route).trim()) {
+      throw new Error('Заполни маршрут груза в строке ' + (index + 1));
+    }
+    if (cargoTripsToNumber_(item.price) <= 0) {
+      throw new Error('Цена должна быть больше нуля в строке ' + (index + 1));
+    }
+    if (!item.paymentType) {
+      throw new Error('Укажи вид оплаты в строке ' + (index + 1));
+    }
+  });
+}
+
+function cargoTripsGenerateTripId_() {
+  const now = new Date();
+  const part = Utilities.formatDate(now, Session.getScriptTimeZone(), 'yyyyMMddHHmmss');
+  const random = Math.floor(Math.random() * 900 + 100);
+  return 'TRIP-' + part + '-' + random;
+}
+
+function cargoTripsGetCreatedAtById_(tripId) {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CARGO_TRIPS_SHEET_TRIPS);
+  const values = sheet.getDataRange().getValues();
+  for (let i = 1; i < values.length; i++) {
+    if (String(values[i][0]) === String(tripId)) {
+      return values[i][18] || new Date();
+    }
+  }
+  return new Date();
+}
+
+function cargoTripsDeleteCargoByTripId_(sheet, tripId) {
+  if (!sheet || sheet.getLastRow() < 2) return;
+
+  const values = sheet.getDataRange().getValues();
+  for (let i = values.length - 1; i >= 1; i--) {
+    if (String(values[i][0]) === String(tripId)) {
+      sheet.deleteRow(i + 1);
+    }
+  }
+}
+
+function cargoTripsFindRowById_(sheet, tripId) {
+  const values = sheet.getDataRange().getValues();
+  for (let i = 1; i < values.length; i++) {
+    if (String(values[i][0]) === String(tripId)) {
+      return i + 1;
+    }
+  }
+  return null;
+}
+
+function cargoTripsNormalizeDate_(dateValue) {
+  if (!dateValue) return '';
+  return new Date(dateValue);
+}
+
+function cargoTripsFormatDateForClient_(value) {
+  if (!value) return '';
+  return Utilities.formatDate(new Date(value), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+}
+
+function cargoTripsFormatDateTimeForClient_(value) {
+  if (!value) return '';
+  return Utilities.formatDate(new Date(value), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss');
+}
+
+function cargoTripsToNumber_(value) {
+  if (value === null || value === undefined || value === '') return 0;
+  const normalized = String(value).replace(',', '.').replace(/\s+/g, '');
+  const num = Number(normalized);
+  return isNaN(num) ? 0 : num;
+}
+
+function cargoTripsGetOrCreateSheet_(ss, name) {
+  let sheet = ss.getSheetByName(name);
+  if (!sheet) {
+    sheet = ss.insertSheet(name);
+  }
+  return sheet;
+}
+
+function cargoTripsPrepareSheet_(sheet, values) {
+  const rowsCount = values.length;
+  const colsCount = values[0].length;
+  const lastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+
+  if (lastRow === 0 || lastCol === 0) {
+    sheet.getRange(1, 1, rowsCount, colsCount).setValues(values);
+    return;
+  }
+
+  const existingHeader = sheet.getRange(1, 1, 1, colsCount).getValues()[0];
+  const targetHeader = values[0];
+  const headerMatches = targetHeader.every(function (headerValue, index) {
+    return String(existingHeader[index] || '').trim() === String(headerValue || '').trim();
+  });
+
+  if (!headerMatches) {
+    sheet.getRange(1, 1, rowsCount, colsCount).setValues(values);
+  } else if (rowsCount > 1) {
+    for (var i = 1; i < rowsCount; i++) {
+      const rowIndex = i + 1;
+      const keyValue = String(values[i][0] || '').trim();
+      const currentKey = String(sheet.getRange(rowIndex, 1).getValue() || '').trim();
+      if (!currentKey && keyValue) {
+        sheet.getRange(rowIndex, 1, 1, colsCount).setValues([values[i]]);
+      }
+    }
+  }
+}
+
+function cargoTripsStyleSheet_(sheet) {
+  const lastCol = Math.max(sheet.getLastColumn(), 1);
+  sheet.getRange(1, 1, 1, lastCol)
+    .setFontWeight('bold')
+    .setBackground('#d9eaf7');
 }
