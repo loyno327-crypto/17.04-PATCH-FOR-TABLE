@@ -66,6 +66,9 @@
         if (p.search) buttons.push(makeButton('Поиск товара', 'openQuickSearch', 'Открываем поиск товара...'));
         if (p.managementDashboard) buttons.push(makeButton('Дашборд руководителя', 'openQuickManagementDashboard', 'Открываем дашборд руководителя...'));
         if (p.managementDashboard) buttons.push(makeButton('Автопарк и поездки', 'openQuickFleetDashboard', 'Открываем панель автопарка и поездок...'));
+        if (info.role === 'Руководитель' || info.role === 'Инженер по снабжению') {
+          buttons.push(makeButton('Грузоперевозки', 'showCargoTripsApp', 'Открываем модуль грузоперевозок...'));
+        }
         if (p.manageAccess) buttons.push(makeButton('Управление доступом', 'showAccessAdminPanel', 'Открываем управление доступом...'));
         if (p.refreshAll) buttons.push(makeButton('Обновить всё', 'openQuickRefreshAll', 'Обновляем данные...'));
 
